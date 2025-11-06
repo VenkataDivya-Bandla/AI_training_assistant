@@ -1,9 +1,36 @@
-.DS_Store
-node_modules
-.idea
+# --- Python / FastAPI / Flask ---
+_pycache_/
+*.py[cod]
+*.sqlite3
+*.db
+.env
+venv/
+.venv*/
+*.log
+
+# --- Node / Vite Frontend ---
+node_modules/
+dist/
+build/
 package-lock.json
-/build
-.vscode/
+.env.local
+.env.development
+.env.production
+
+# --- IDE / OS Files ---
+.DS_Store
 .idea/
-vite.config.*s.*
-.venv311
+.vscode/
+*.swp
+
+# --- System / Cache ---
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+_pypackages_/
+
+# --- Optional: model or data folders ---
+/models/
+/uploads/
+/output/
+/temp/
