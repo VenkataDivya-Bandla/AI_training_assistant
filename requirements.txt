@@ -15,5 +15,7 @@ requests>=2.25.0
 yt-dlp>=2023.12.30
 pydub>=0.25.1
 ffmpeg-python>=0.2.0
-
+flask
+flask_sqlalchemy
+flask_cors
 

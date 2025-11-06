@@ -15,7 +15,7 @@ const CredentialsHelper = () => {
     {
       role: 'HR Admin',
       email: 'hr@company.com',
-      password: 'hr123',
+      password: 'hr@123',
       description: 'HR dashboard and admin features'
     },
     {

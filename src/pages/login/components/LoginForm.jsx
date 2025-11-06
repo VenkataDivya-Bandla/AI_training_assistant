@@ -18,7 +18,7 @@ const LoginForm = () => {
   // Mock credentials for different user types
   const mockCredentials = {
     'employee@company.com': { password: 'employee123', role: 'employee', name: 'John Smith' },
-    'hr@company.com': { password: 'hr123', role: 'hr_admin', name: 'Sarah Johnson' },
+    'hr@company.com': { password: 'hr@123', role: 'hr_admin', name: 'Sarah Johnson' },
     'manager@company.com': { password: 'manager123', role: 'manager', name: 'Mike Wilson' }
   };
 

@@ -3,6 +3,7 @@ import Button from '../../../components/ui/Button';
 import Icon from '../../../components/AppIcon';
 
 // RAG API endpoint
+// RAG API endpoint
 const RAG_API_URL = 'http://localhost:8000/api/generate_quiz';
 
 // --- HELPER FUNCTION: PARSE RAG TEXT INTO JS ARRAY ---

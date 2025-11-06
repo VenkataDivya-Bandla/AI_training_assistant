@@ -1,163 +1,193 @@
 import os
-import pathlib
-from typing import Optional
-
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 from fastapi import FastAPI
-from pydantic import BaseModel
-
-from langchain.chains import RetrievalQA
-from langchain.llms.base import LLM
-from langchain_community.llms import HuggingFacePipeline, Ollama
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import pypdf
+from langchain_ollama import OllamaLLM
+import requests
+import sqlalchemy
+import uvicorn
 
-from document_processor import load_pdf_documents, split_documents
-from vector_store import build_or_load_faiss_index, get_retriever
+# ------------------------------------------------
+# FastAPI initialization
+# ------------------------------------------------
+app = FastAPI(title="Ollama Semantic RAG Backend", version="1.0.0")
 
-
-class AskRequest(BaseModel):
-    question: str
-
-
-class AskResponse(BaseModel):
-    answer: str
-
-
-app = FastAPI(title="Local RAG Backend", version="1.0.0")
-
-# Enable CORS for local dev frontends
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ------------------------------------------------
+# Request / Response Models
+# ------------------------------------------------
+class AskRequest(BaseModel):
+    question: str
 
-# Global singletons created at startup
-_VECTORSTORE = None
-_RETRIEVER = None
-_LLM: Optional[LLM] = None
+class AskResponse(BaseModel):
+    answer: str
 
+# ------------------------------------------------
+# Model & Embedding Setup
+# ------------------------------------------------
+LLM = None
+EMBED_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+CHUNKS = []
+CHUNK_EMBEDDINGS = None
 
-def _init_local_llm() -> LLM:
-    """Initialize a local LLM using either Hugging Face transformers or Ollama.
-
-    Env vars:
-    - LLM_BACKEND: "transformers" or "ollama" (default: transformers)
-    - HF_MODEL_NAME: transformers model name (default: "sshleifer/tiny-gpt2")
-    - OLLAMA_MODEL: ollama model name (default: "mistral")
-    - LLM_DEVICE: device for transformers (e.g., "cpu" or "cuda")
-    """
-    backend = os.getenv("LLM_BACKEND", "transformers").lower()
-
-    if backend == "ollama":
-        model = os.getenv("OLLAMA_MODEL", "mistral")
-        return Ollama(model=model)
-
-    # Lazy import transformers only when needed
+# ------------------------------------------------
+# Ollama Helpers
+# ------------------------------------------------
+def check_ollama_connection():
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(
-            "Transformers backend selected but 'transformers' could not be imported. Install compatible versions or switch to Ollama by setting LLM_BACKEND=ollama."
-        ) from exc
+        response = requests.get("http://localhost:11434", timeout=3)
+        return response.status_code == 200
+    except:
+        return False
 
-    # Use a more reliable model for local dev
-    model_name = os.getenv("HF_MODEL_NAME", "microsoft/DialoGPT-small")
-    device = 0 if os.getenv("LLM_DEVICE", "cpu") == "cuda" else -1
+def initialize_ollama():
+    global LLM
+    try:
+        if check_ollama_connection():
+            LLM = OllamaLLM(model="llama2", base_url="http://localhost:11434")
+            LLM.generate(["Say OK"])
+            print("✅ Ollama connection established successfully")
+            return True
+        else:
+            print("❌ Ollama server not running")
+            return False
+    except Exception as e:
+        print(f"❌ Ollama init failed: {e}")
+        return False
+
+# ------------------------------------------------
+# PDF Loader
+# ------------------------------------------------
+def load_pdf_chunks(pdf_path="Handbook.pdf", chunk_size=1000):
+    global CHUNKS, CHUNK_EMBEDDINGS
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    pdf_path = os.path.join(current_dir, pdf_path)
+
+    if not os.path.exists(pdf_path):
+        print(f"❌ PDF not found: {pdf_path}")
+        CHUNKS = []
+        CHUNK_EMBEDDINGS = None
+        return False
+
+    print(f"📘 Loading PDF: {pdf_path}")
+    local_chunks, local_embeddings = [], []
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=None,
-            device_map="auto" if device == 0 else None,
-        )
+        with open(pdf_path, "rb") as file:
+            pdf = pypdf.PdfReader(file)
+            for page_num, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                if not text:
+                    continue
+                for i in range(0, len(text), chunk_size):
+                    chunk = text[i : i + chunk_size]
+                    local_chunks.append((chunk, page_num + 1))
+                    emb = EMBED_MODEL.encode(chunk)
+                    local_embeddings.append(emb)
 
-        generate_text = pipeline(
-            task="text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            max_new_tokens=256,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.7,
-            repetition_penalty=1.1,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load model {model_name}: {exc}") from exc
+        CHUNKS = local_chunks
+        CHUNK_EMBEDDINGS = np.array(local_embeddings)
+        print(f"✅ Loaded {len(CHUNKS)} chunks")
+        return True
+    except Exception as e:
+        print(f"❌ Error loading PDF: {e}")
+        CHUNKS = []
+        CHUNK_EMBEDDINGS = None
+        return False
 
-    return HuggingFacePipeline(pipeline=generate_text)
+# ------------------------------------------------
+# Startup
+# ------------------------------------------------
+@app.on_event("startup")
+def startup_event():
+    print("🚀 Starting backend...")
+    load_pdf_chunks()
+    initialize_ollama()
+    print("✅ Startup complete.")
 
-
-@app.get("/")
-def root():
-    return {
-        "message": "RAG backend is running. Use POST /ask or open /docs.",
-        "docs_url": "/docs",
-        "health_url": "/health",
-    }
-
-
-@app.get("/health")
+# ------------------------------------------------
+# Health & Status
+# ------------------------------------------------
+@app.get("/api/health")
 def health():
     return {"status": "ok"}
 
+@app.get("/api/status")
+def system_status():
+    ollama_server_ok = check_ollama_connection()
+    pdf_loaded = len(CHUNKS) > 0
+    return {
+        "ollama_server": ollama_server_ok,
+        "pdf_loaded": pdf_loaded,
+        "chunks": len(CHUNKS),
+    }
 
-@app.on_event("startup")
-def startup_event():
-    global _VECTORSTORE, _RETRIEVER, _LLM
-
-    # Ensure FAISS dir exists
-    pathlib.Path(os.getenv("FAISS_DIR", "faiss_index")).mkdir(parents=True, exist_ok=True)
-
-    # Build or load vectorstore
-    try:
-        # Try to load existing index
-        _VECTORSTORE = build_or_load_faiss_index()
-    except Exception:
-        # If not existing, build from PDF
-        docs = load_pdf_documents()
-        chunks = split_documents(docs, chunk_size_tokens=500, chunk_overlap_tokens=50)
-        _VECTORSTORE = build_or_load_faiss_index(chunks)
-
-    _RETRIEVER = get_retriever(_VECTORSTORE, k=3)
-    _LLM = _init_local_llm()
-
-
-@app.post("/ask", response_model=AskResponse)
+# ------------------------------------------------
+# Main RAG endpoint
+# ------------------------------------------------
+@app.post("/api/ask", response_model=AskResponse)
 def ask(payload: AskRequest):
-    """RAG endpoint: retrieve top-k context and generate answer with local LLM.
+    question = payload.question.strip()
+    if not question:
+        return AskResponse(answer="Please ask a valid question.")
 
-    The answer should be grounded in the PDF contents because the retriever provides context to the LLM.
-    """
-    if not payload.question or not payload.question.strip():
-        return AskResponse(answer="Please provide a non-empty question.")
+    if CHUNK_EMBEDDINGS is None or len(CHUNKS) == 0:
+        return AskResponse(answer="❌ No PDF data loaded.")
 
     try:
-        if not _LLM:
-            return AskResponse(answer="LLM not initialized. Please check server logs.")
-        
-        if not _RETRIEVER:
-            return AskResponse(answer="Retriever not initialized. Please check server logs.")
+        q_embed = EMBED_MODEL.encode(question).reshape(1, -1)
+        sims = cosine_similarity(q_embed, CHUNK_EMBEDDINGS)[0]
+        top_idx = sims.argsort()[-3:][::-1]
 
-        chain = RetrievalQA.from_chain_type(
-            llm=_LLM,
-            chain_type="stuff",
-            retriever=_RETRIEVER,
-            return_source_documents=False,
+        context = "\n\n".join([CHUNKS[i][0] for i in top_idx])
+        pages = sorted(list(set([CHUNKS[i][1] for i in top_idx])))
+
+        prompt = (
+            f"Use the context below to answer clearly.\n\n"
+            f"Context (pages {pages}):\n{context}\n\nQuestion: {question}\nAnswer:"
         )
 
-        result = chain.invoke({"query": payload.question.strip()})
-        answer_text = result["result"] if isinstance(result, dict) else str(result)
-        return AskResponse(answer=answer_text)
-    
+        answer = LLM.generate([prompt])
+        answer_text = answer.generations[0][0].text.strip()
+        return AskResponse(answer=f"{answer_text}\n\n📄 Pages: {pages}")
     except Exception as e:
-        print(f"Error in ask endpoint: {e}")
-        return AskResponse(answer=f"Error processing question: {str(e)}")
+        return AskResponse(answer=f"❌ Error: {e}")
+
+# ------------------------------------------------
+# Frontend Static File Serving (IMPORTANT)
+# ------------------------------------------------
+# Serve static files from the Vite build folder
+BUILD_DIR = os.path.join(os.path.dirname(__file__), "build")
+
+if os.path.exists(BUILD_DIR):
+    app.mount("/assets", StaticFiles(directory=os.path.join(BUILD_DIR, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        file_path = os.path.join(BUILD_DIR, full_path)
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(BUILD_DIR, "index.html"))
+else:
+    print("⚠ Build folder not found. Run npm run build first.")
+
+# ------------------------------------------------
+# Entry Point
+# ------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
