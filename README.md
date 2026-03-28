@@ -24,3 +24,7 @@ An AI-powered onboarding and training platform that helps new employees learn th
 cd backend
 pip install -r requirements.txt
 uvicorn main:app --reload
+###Frontend
+cd frontend
+npm install
+npm run dev
